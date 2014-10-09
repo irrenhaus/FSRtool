@@ -9,7 +9,7 @@
 #define TRIGGER_LEVEL             LOW
 
 // Defines if readings should be averaged.
-#define NUM_AVERAGE_READINGS      2
+#define NUM_AVERAGE_READINGS      0
 
 // How many readings should be averaged for getting the base-level value
 #define BASE_LEVEL_AVG_READINGS   10
@@ -17,6 +17,8 @@
 // Specify how long to wait for a trigger event before resetting
 // the base-level value.
 #define RESET_AFTER_SECONDS       5
+
+#define FLAP_DETECTION_BUFFER     64
 
 // How many reads should occur per second
 // This ignores the time needed for processing and the time needed for the
@@ -27,7 +29,7 @@
 
 // As soon as the difference of the current reading to the previous/average
 // reading is at least as high as this number, trigger the endstop
-#define TRIGGER_HIGH_MARK         32
+#define TRIGGER_HIGH_MARK         64
 // As soon as the negative difference of the current reading to the
 // previous/average reading is at least as high as this number, reset
 // the endstop
@@ -36,10 +38,34 @@
 // The analog pins on which the FSRs can be read
 uint8_t analogIn[3] = {A0, A1, A2};
 
-uint8_t  triggered[3] = {0, 0, 0};
-uint32_t lastBaseLevelReset = 0;
+uint8_t  triggered[4] = {0, 0, 0, 0};
+unsigned long lastBaseLevelReset = 0;
 uint16_t baseLevel[3] = {0, 0, 0};
 uint16_t reading[3] = {0, 0, 0};
+
+uint8_t flapDetectionBuf[FLAP_DETECTION_BUFFER];
+uint8_t  flapPos = 0;
+uint8_t  flapDataPoints = 0;
+
+uint8_t  detectFlapping(uint8_t changed) {
+    flapDetectionBuf[flapPos] = changed;
+    if(flapPos >= FLAP_DETECTION_BUFFER) {
+        flapPos = 0;
+    } else {
+        flapPos++;
+    }
+
+    if(flapDataPoints < FLAP_DETECTION_BUFFER) {
+        flapDataPoints++;
+    }
+
+    uint8_t changes = 0;
+    for(uint8_t i = 0; i < flapDataPoints; i++) {
+        changes += flapDataPoints;
+    }
+
+    return (changes > (flapDataPoints/2));
+}
 
 void readBaseLevel() {
     for(uint8_t i = 0; i < 3; i++) {
@@ -49,7 +75,10 @@ void readBaseLevel() {
         }
         fsr /= BASE_LEVEL_AVG_READINGS;
         baseLevel[i] = fsr;
+
+        triggered[i] = 0;
     }
+    triggered[3] = 0;
 }
 
 void setup()
@@ -58,9 +87,11 @@ void setup()
     Serial.begin(115200);
 #endif
 
-    // Enable 5V output so that we can read the FSRs...
-    pinMode(13, OUTPUT);
-    digitalWrite(13, HIGH);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    pinMode(TRIGGER_PIN, OUTPUT);
+    digitalWrite(TRIGGER_PIN, ! TRIGGER_LEVEL);
 
     // Setup the analog inputs
     analogReference(DEFAULT);
@@ -71,10 +102,13 @@ void setup()
     }
 
     readBaseLevel();
+    lastBaseLevelReset = millis();
 }
 
 void loop()
 {
+    uint8_t triggerChanged = 0;
+
     for(uint8_t i = 0; i < 3; i++) {
 #if NUM_AVERAGE_READINGS > 0
         reading[i] = 0;
@@ -90,37 +124,95 @@ void loop()
         int16_t highMark = min(INT16_MAX, int16_t(baseLevel[i] + TRIGGER_HIGH_MARK));
 
         if(reading[i] > highMark) {
-            triggered[i] = 1;
-            // Reset the base-level-reset timer
-            lastBaseLevelReset = millis();
-        } else if(reading[i] < lowMark) {
-            triggered[i] = 0;
-            // Reset the base-level-reset timer
-            lastBaseLevelReset = millis();
-        } else {
-            if((millis() - lastBaseLevelReset) > (RESET_AFTER_SECONDS * 1000)) {
-                readBaseLevel();
+            if(!triggered[i]) {
                 lastBaseLevelReset = millis();
+                triggerChanged = 1;
+                triggered[i] = 1;
             }
+        } else if(triggered[i] && (reading[i] < lowMark || baseLevel[i] < TRIGGER_LOW_MARK)) {
+            triggerChanged = 1;
+            triggered[i] = 0;
         }
+
     }
 
-#if DEBUG > 0
-    Serial.print("Triggered: a:");
-    Serial.print(triggered[0]);
-    Serial.print(" b:");
-    Serial.print(triggered[1]);
-    Serial.print(" c:");
-    Serial.println(triggered[2]);
-#endif
+    int16_t accuRead = reading[0] + reading[1] + reading[2];
+    int16_t accuBase = baseLevel[0] + baseLevel[1] + baseLevel[2];
 
-    if(triggered[0] + triggered[1] + triggered[2] > 0) {
+    int16_t accuLowMark = max(0, int16_t(accuBase - TRIGGER_LOW_MARK*2));
+    int16_t accuHighMark = min(INT16_MAX, int16_t(accuBase + TRIGGER_HIGH_MARK*2));
+
+    if(accuRead > accuHighMark) {
+        if(!triggered[3]) {
+            lastBaseLevelReset = millis();
+            triggerChanged = 1;
+            triggered[3] = 1;
+        }
+    } else if(triggered[3] && (accuRead < accuLowMark || accuBase < TRIGGER_LOW_MARK)) {
+        triggerChanged = 1;
+        triggered[3] = 0;
+    }
+
+    if((millis() - lastBaseLevelReset) > (unsigned long)(RESET_AFTER_SECONDS * 1000)) {
+        Serial.println("Reset base level!");
+        readBaseLevel();
+        lastBaseLevelReset = millis();
+
+        triggerChanged = 1;
+    }
+
+    if(detectFlapping(triggerChanged)) {
+        // We are flapping, for safety assume triggered.
+        triggered[3] = 1;
+
+        Serial.println("FLAPPING");
+    }
+
+    if(triggered[0] + triggered[1] + triggered[2] + triggered[3] > 0) {
         digitalWrite(TRIGGER_PIN, TRIGGER_LEVEL);
         digitalWrite(LED_PIN, HIGH);
     } else {
         digitalWrite(TRIGGER_PIN, !TRIGGER_LEVEL);
         digitalWrite(LED_PIN, LOW);
     }
+
+#if DEBUG > 0
+    if(triggerChanged) {
+        Serial.print("Triggered: a:");
+        Serial.print(triggered[0]);
+        Serial.print(" b:");
+        Serial.print(triggered[1]);
+        Serial.print(" c:");
+        Serial.print(triggered[2]);
+        Serial.print(" d:");
+        Serial.println(triggered[3]);
+
+        Serial.print("Reading: a:");
+        Serial.print(reading[0]);
+        Serial.print(" b:");
+        Serial.print(reading[1]);
+        Serial.print(" c:");
+        Serial.print(reading[2]);
+        Serial.print(" d:");
+        Serial.println(accuRead);
+
+        Serial.print("BaseLevel: a:");
+        Serial.print(baseLevel[0]);
+        Serial.print(" b:");
+        Serial.print(baseLevel[1]);
+        Serial.print(" c:");
+        Serial.print(baseLevel[2]);
+        Serial.print(" d:");
+        Serial.println(accuBase);
+
+        Serial.print("Last reset:");
+        Serial.print(millis() - lastBaseLevelReset);
+        Serial.println("ms ago");
+
+        Serial.println(" ");
+    }
+#endif
+
 
 #if READS_PER_SECOND > 0
     delay(1000 / READS_PER_SECOND);
